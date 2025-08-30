@@ -3,8 +3,65 @@ import { Upload, FileText, BarChart3, PieChart } from 'lucide-react';
 import Papa from 'papaparse';
 import _ from 'lodash';
 
-// CSV Parser Component
-const CSVUploader = ({ onDataParsed }) => {
+// ==== Gemini API Utility ====
+// NOTE: Replace 'YOUR_GEMINI_API_KEY' with your actual Gemini API key.
+const GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=AIzaSyBHx0waZVi4KHoEcrdO49sQ4MGaU1yQiq0";
+
+async function analyzeTextWithGemini(text) {
+  const prompt = `Analyze the following text for sentiment polarity (range: -1 to 1), subjectivity (range: 0 to 1), and extract named entities. Return ONLY valid JSON in the following format: {"polarity": <number>, "subjectivity": <number>, "named_entities": [<entities>]}.\nText: "${text}"`;
+
+  const body = {
+    contents: [{ parts: [{ text: prompt }] }]
+  };
+
+  const response = await fetch(GEMINI_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) throw new Error('Gemini API error');
+  const result = await response.json();
+
+  // Parse result, assuming the response JSON is in the text field.
+  const reply = result?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
+  try {
+    return JSON.parse(reply);
+  } catch {
+    // If parsing fails, return default values
+    return { polarity: 0, subjectivity: 0, named_entities: [] };
+  }
+}
+
+// ==== Batch Gemini Analysis ====
+async function processRowsWithGemini(data, setStatus) {
+  const updatedRows = [];
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+    const text = row.sentiment || row.Sentiment || row.text || row.Text || '';
+    if (!text) {
+      updatedRows.push({ ...row, polarity: 0, subjectivity: 0, named_entities: [] });
+      continue;
+    }
+    setStatus?.(`Analyzing row ${i + 1} of ${data.length}...`);
+    try {
+      const geminiResult = await analyzeTextWithGemini(text);
+      updatedRows.push({
+        ...row,
+        polarity: geminiResult.polarity,
+        subjectivity: geminiResult.subjectivity,
+        named_entities: geminiResult.named_entities,
+      });
+    } catch (e) {
+      updatedRows.push({ ...row, polarity: 0, subjectivity: 0, named_entities: [] });
+    }
+  }
+  setStatus?.(null);
+  return updatedRows;
+}
+
+// ==== CSV Uploader ====
+const CSVUploader = ({ onDataParsed, setStatus }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
@@ -20,8 +77,8 @@ const CSVUploader = ({ onDataParsed }) => {
       skipEmptyLines: true,
       dynamicTyping: true,
       delimitersToGuess: [',', '\t', '|', ';'],
-      complete: (results) => {
-        // Clean headers by trimming whitespace
+      complete: async (results) => {
+        // Clean headers
         const cleanedData = results.data.map(row => {
           const cleanedRow = {};
           Object.keys(row).forEach(key => {
@@ -31,7 +88,9 @@ const CSVUploader = ({ onDataParsed }) => {
           return cleanedRow;
         });
 
-        onDataParsed(cleanedData);
+        setStatus("Processing rows with Gemini...");
+        const analyzedData = await processRowsWithGemini(cleanedData, setStatus);
+        onDataParsed(analyzedData);
         setIsLoading(false);
       },
       error: (error) => {
@@ -40,7 +99,7 @@ const CSVUploader = ({ onDataParsed }) => {
         setIsLoading(false);
       }
     });
-  }, [onDataParsed]);
+  }, [onDataParsed, setStatus]);
 
   const handleDrop = useCallback((e) => {
     e.preventDefault();
@@ -92,19 +151,15 @@ const CSVUploader = ({ onDataParsed }) => {
   );
 };
 
-// Data Processing Component
+// ==== Sentiment Processor ====
 const SentimentProcessor = ({ data }) => {
   // Group data by polarity and subjectivity ranges
   const processedData = React.useMemo(() => {
     if (!data || data.length === 0) return null;
 
     // Check if required columns exist
-    const hasPolarity = data.some(row =>
-      row.polarity !== undefined || row.Polarity !== undefined
-    );
-    const hasSubjectivity = data.some(row =>
-      row.subjectivity !== undefined || row.Subjectivity !== undefined
-    );
+    const hasPolarity = data.some(row => row.polarity !== undefined);
+    const hasSubjectivity = data.some(row => row.subjectivity !== undefined);
 
     if (!hasPolarity || !hasSubjectivity) {
       return { error: 'CSV must contain polarity and subjectivity columns' };
@@ -113,8 +168,8 @@ const SentimentProcessor = ({ data }) => {
     // Normalize column names and convert to numbers
     const normalizedData = data.map(row => ({
       ...row,
-      polarity: Number(row.polarity || row.Polarity || 0),
-      subjectivity: Number(row.subjectivity || row.Subjectivity || 0),
+      polarity: Number(row.polarity),
+      subjectivity: Number(row.subjectivity),
       sentiment: row.sentiment || row.Sentiment || row.text || row.Text || 'N/A'
     })).filter(row => !isNaN(row.polarity) && !isNaN(row.subjectivity));
 
@@ -294,6 +349,9 @@ const SentimentProcessor = ({ data }) => {
                   Subjectivity
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                  Named Entities
+                </th>
+                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Category
                 </th>
               </tr>
@@ -315,15 +373,18 @@ const SentimentProcessor = ({ data }) => {
                         row.polarity < -0.1 ? 'bg-red-100 text-red-800' :
                         'bg-yellow-100 text-yellow-800'
                       }`}>
-                        {row.polarity.toFixed(3)}
+                        {row.polarity?.toFixed(3)}
                       </span>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-900">
                       <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
                         row.subjectivity > 0.5 ? 'bg-purple-100 text-purple-800' : 'bg-blue-100 text-blue-800'
                       }`}>
-                        {row.subjectivity.toFixed(3)}
+                        {row.subjectivity?.toFixed(3)}
                       </span>
+                    </td>
+                    <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate">
+                      {(row.named_entities || []).join(', ')}
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-500">
                       {polarityLabel} & {subjectivityLabel}
@@ -344,10 +405,11 @@ const SentimentProcessor = ({ data }) => {
   );
 };
 
-// Main App Component
+// ==== Main App ====
 const SentimentHub = () => {
   const [csvData, setCsvData] = useState(null);
   const [activeTab, setActiveTab] = useState('upload');
+  const [status, setStatus] = useState(null);
 
   const handleDataParsed = useCallback((data) => {
     setCsvData(data);
@@ -357,6 +419,7 @@ const SentimentHub = () => {
   const resetApp = () => {
     setCsvData(null);
     setActiveTab('upload');
+    setStatus(null);
   };
 
   return (
@@ -384,6 +447,13 @@ const SentimentHub = () => {
       {/* Main Content */}
       <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
         <div className="px-4 py-6 sm:px-0">
+          {status && (
+            <div className="max-w-lg mx-auto mb-4">
+              <div className="bg-blue-50 border border-blue-200 text-blue-800 rounded-lg p-4 text-center">
+                {status}
+              </div>
+            </div>
+          )}
           {!csvData ? (
             <div className="text-center">
               <div className="mb-8">
@@ -396,7 +466,7 @@ const SentimentHub = () => {
                   columns to analyze and visualize your sentiment patterns.
                 </p>
               </div>
-              <CSVUploader onDataParsed={handleDataParsed} />
+              <CSVUploader onDataParsed={handleDataParsed} setStatus={setStatus} />
 
               {/* Expected Format Info */}
               <div className="mt-8 max-w-2xl mx-auto text-left">
@@ -408,10 +478,11 @@ const SentimentHub = () => {
                     Your CSV should contain these columns:
                   </p>
                   <ul className="text-sm text-gray-600 space-y-1">
-                    <li><strong>polarity</strong>: Numeric value (-1 to 1, where -1 is negative, 1 is positive)</li>
-                    <li><strong>subjectivity</strong>: Numeric value (0 to 1, where 0 is objective, 1 is subjective)</li>
-                    <li><strong>sentiment/text</strong>: The actual text content (optional)</li>
+                    <li><strong>sentiment/text</strong>: The actual text content (required for Gemini analysis)</li>
                   </ul>
+                  <p className="text-sm text-gray-600 mt-2">
+                    All other columns will be populated by Gemini automatically on upload.
+                  </p>
                 </div>
               </div>
             </div>
